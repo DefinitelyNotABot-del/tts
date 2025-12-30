@@ -108,13 +108,24 @@ tts/
 
 ## 🔧 Configuration
 
-### GPU Settings
-Edit `app.py` to modify GPU configuration:
+### GPU & CPU Settings
+Edit `app.py` or set environment variables to modify configuration:
 
 ```python
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # GPU index
-os.environ["SUNO_OFFLOAD_CPU"] = "False"  # Keep models on GPU
+os.environ["SUNO_OFFLOAD_CPU"] = "False"  # Keep models on GPU by default
 os.environ["SUNO_USE_SMALL_MODELS"] = "False"  # Use full quality models
+```
+
+You can force the app to use more CPU when GPU is busy:
+- Set `BARK_CPU_THREADS` environment variable (defaults to number of cores - 1)
+- In the UI, enable **Aggressive CPU mode** to force CPU-only generation for current requests
+
+Example (PowerShell):
+
+```powershell
+$env:BARK_CPU_THREADS = 12
+python app.py
 ```
 
 ### Voice Presets

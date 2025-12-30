@@ -18,9 +18,15 @@ class TTSPlayer {
         // Settings
         this.selectedVoice = 'v2/en_speaker_6';
         this.readCodeSymbols = true;
+        this.useFullGen = false; // single-file generation toggle
+        this.hybridMode = true; // auto GPU/CPU fallback
         
-        // Rewind tracking
+        // Playback tracking
         this.currentLineStarted = false;
+        this.currentChunkSize = 1; // how many lines are in the current audio chunk
+        this.playGenerateLock = false; // prevent overlapping generation requests
+        this.rewindPressedOnce = false;
+        this.rewindTimer = null;
         
         // DOM Elements
         this.initElements();
@@ -46,6 +52,10 @@ class TTSPlayer {
         this.rewindBtn = document.getElementById('rewindBtn');
         this.downloadBtn = document.getElementById('downloadBtn');
         this.clearCacheBtn = document.getElementById('clearCacheBtn');
+        
+        // Additional settings
+        this.useFullGenCheckbox = document.getElementById('useFullGen');
+        this.hybridModeCheckbox = document.getElementById('hybridMode');
         
         // Icons
         this.playPauseIcon = document.getElementById('playPauseIcon');
@@ -94,6 +104,30 @@ class TTSPlayer {
         this.rewindBtn.addEventListener('click', () => this.rewindLine());
         this.downloadBtn.addEventListener('click', () => this.downloadAudio());
         this.clearCacheBtn.addEventListener('click', () => this.clearCache());
+        
+        // Settings toggles
+        this.useFullGenCheckbox.addEventListener('change', (e) => { this.useFullGen = e.target.checked; });
+        this.hybridModeCheckbox.addEventListener('change', (e) => { this.hybridMode = e.target.checked; });
+        this.forceCpuCheckbox = document.getElementById('forceCpuMode');
+        this.useCpuAggressive = false;
+        this.forceCpuCheckbox?.addEventListener('change', (e) => { this.useCpuAggressive = e.target.checked; });
+        
+        // Audio events
+        this.audioPlayer.addEventListener('timeupdate', () => this.updateProgress());
+        this.audioPlayer.addEventListener('ended', () => this.onLineEnded());
+        this.audioPlayer.addEventListener('play', () => {
+            this.isPlaying = true;
+            this.isPaused = false;
+            this.playPauseIcon.className = 'fas fa-pause';
+        });
+        this.audioPlayer.addEventListener('pause', () => {
+            this.isPaused = true;
+            this.playPauseIcon.className = 'fas fa-play';
+        });
+        this.audioPlayer.addEventListener('error', (e) => {
+            console.error('Audio element error', e);
+            this.setStatus('Playback engine error', 'error');
+        });
         
         // Settings events
         this.voiceSelect.addEventListener('change', (e) => {
@@ -392,52 +426,135 @@ class TTSPlayer {
         this.showLoading('🧠 BARK AI generating speech...');
         
         try {
-            const text = this.processedLines[this.currentLineIndex];
-            
-            // Check cache first
-            const cacheKey = `${text}_${this.selectedVoice}`;
+            // Avoid overlapping generation requests
+            if (this.playGenerateLock) return;
+            this.playGenerateLock = true;
+
+            // Determine if we should generate full file
+            if (this.useFullGen) {
+                this.showLoading('🧠 Generating full audio (this may take longer)...');
+                const response = await fetch('/api/generate-full-audio', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        text: this.textInput.value.trim(),
+                        voice: this.selectedVoice,
+                        readCodeSymbols: this.readCodeSymbols,
+                        hybrid: this.hybridMode,
+                        force_cpu: this.useCpuAggressive
+                    })
+                });
+
+                if (!response.ok) throw new Error('Failed to generate full audio');
+
+                const blob = await response.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                this.audioCache.set(`full_${this.selectedVoice}`, audioUrl);
+
+                this.currentChunkSize = this.lines.length; // full file covers all lines
+                this.audioPlayer.src = audioUrl;
+                this.audioPlayer.load();
+                this.audioPlayer.currentTime = 0;
+                await this.audioPlayer.play();
+
+                this.currentLineStarted = true;
+                this.isPlaying = true;
+                this.isPaused = false;
+                this.playPauseIcon.className = 'fas fa-pause';
+
+                this.hideLoading();
+                this.updatePlayerDisplay();
+                this.setStatus('🎵 Playing full audio...');
+                this.playGenerateLock = false;
+                return;
+            }
+
+            // Context-aware generation: if the current line is very short, merge next line(s)
+            const MIN_LEN = 45;
+            let chunkText = this.processedLines[this.currentLineIndex];
+            this.currentChunkSize = 1;
+            while (chunkText.length < MIN_LEN && (this.currentLineIndex + this.currentChunkSize) < this.processedLines.length && this.currentChunkSize < 3) {
+                chunkText = chunkText + ' ' + this.processedLines[this.currentLineIndex + this.currentChunkSize];
+                this.currentChunkSize += 1;
+            }
+
+            const cacheKey = `${chunkText}_${this.selectedVoice}`;
             let audioUrl = this.audioCache.get(cacheKey);
-            
+
             if (!audioUrl) {
                 const response = await fetch('/api/generate-line-audio', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        text: text,
-                        voice: this.selectedVoice
+                        text: chunkText,
+                        voice: this.selectedVoice,
+                        hybrid: this.hybridMode,
+                        force_cpu: this.useCpuAggressive
                     })
                 });
-                
+
                 if (!response.ok) {
                     throw new Error('Failed to generate audio');
                 }
-                
+
                 const blob = await response.blob();
                 audioUrl = URL.createObjectURL(blob);
                 this.audioCache.set(cacheKey, audioUrl);
             }
-            
+
+            // Play
+            // Pause any existing playback and reset position before loading new audio
+            try { this.audioPlayer.pause(); } catch(e){}
+            try { this.audioPlayer.currentTime = 0; } catch(e){}
+            this.audioPlayer.playbackRate = 1.0; // Ensure normal speed
+
             this.audioPlayer.src = audioUrl;
+            this.audioPlayer.load();
+
+            // Wait for metadata to ensure duration is valid (avoid silent files)
+            const metadataPromise = new Promise((resolve, reject) => {
+                const onMeta = () => { cleanup(); resolve(true); };
+                const onErr = () => { cleanup(); reject(new Error('Audio failed to load metadata')); };
+                const cleanup = () => {
+                    this.audioPlayer.removeEventListener('loadedmetadata', onMeta);
+                    this.audioPlayer.removeEventListener('error', onErr);
+                };
+                this.audioPlayer.addEventListener('loadedmetadata', onMeta);
+                this.audioPlayer.addEventListener('error', onErr);
+                // Timeout after 8s
+                setTimeout(() => { cleanup(); reject(new Error('Timed out waiting for audio metadata')); }, 8000);
+            });
+
+            await metadataPromise;
+
+            if (!this.audioPlayer.duration || isNaN(this.audioPlayer.duration) || this.audioPlayer.duration < 0.01) {
+                throw new Error('Generated audio appears empty');
+            }
+
+            this.audioPlayer.currentTime = 0;
             await this.audioPlayer.play();
-            
+
             this.isPlaying = true;
             this.isPaused = false;
             this.currentLineStarted = true;
             this.playPauseIcon.className = 'fas fa-pause';
-            
+
             this.hideLoading();
             this.updatePlayerDisplay();
-            this.setStatus(`🎵 Playing line ${this.currentLineIndex + 1} of ${this.lines.length}...`);
-            
-            // Preload next line
+            const endLine = Math.min(this.lines.length, this.currentLineIndex + this.currentChunkSize);
+            this.setStatus(`🎵 Playing lines ${this.currentLineIndex+1}-${endLine} of ${this.lines.length}...`);
+
+            // Preload next line/chunk
             this.preloadNextLine();
-            
+            this.playGenerateLock = false;
+
         } catch (error) {
             console.error('Playback error:', error);
             this.hideLoading();
             this.setStatus('Playback error - retrying...', 'error');
-            
-            // Retry once
+            this.playGenerateLock = false;
+
+            // Retry once after a short delay
             setTimeout(() => this.playCurrentLine(), 1000);
         }
     }
@@ -472,10 +589,12 @@ class TTSPlayer {
     }
     
     onLineEnded() {
-        this.currentLineIndex++;
+        // Advance by the number of lines covered in the current chunk
+        this.currentLineIndex += Math.max(1, this.currentChunkSize);
         this.currentLineStarted = false;
+        this.currentChunkSize = 1;
         this.progressFill.style.width = '0%';
-        
+
         if (this.currentLineIndex < this.lines.length) {
             this.updatePlayerDisplay();
             this.playCurrentLine();
@@ -501,43 +620,54 @@ class TTSPlayer {
     
     rewindLine() {
         if (this.lines.length === 0) return;
-        
-        if (this.currentLineStarted) {
-            // First rewind - restart current line
+
+        // Use a double-press detection with a short timeout
+        if (!this.rewindPressedOnce) {
+            // First press: restart current line
+            this.rewindPressedOnce = true;
+            clearTimeout(this.rewindTimer);
+            this.rewindTimer = setTimeout(() => { this.rewindPressedOnce = false; }, 1400);
+
             this.audioPlayer.currentTime = 0;
             this.progressFill.style.width = '0%';
-            
+
             if (this.isPaused) {
-                // If paused, just reset position
                 this.setStatus(`Rewound line ${this.currentLineIndex + 1} - Press play to start`);
             } else if (this.isPlaying) {
-                // If playing, replay current line
                 this.playCurrentLine();
             }
-            
-            this.currentLineStarted = false;
+
         } else {
-            // Second rewind (or not started yet) - go to previous line
+            // Second press within timeout: go to previous line
+            clearTimeout(this.rewindTimer);
+            this.rewindPressedOnce = false;
             this.previousLine();
         }
     }
     
     previousLine() {
         if (this.lines.length === 0) return;
-        
+
         if (this.currentLineIndex > 0) {
-            this.currentLineIndex--;
+            // Stop current playback cleanly
+            try { this.audioPlayer.pause(); } catch(e){}
+            try { this.audioPlayer.currentTime = 0; } catch(e){}
+
+            // Move back one line (consistent with user expectation)
+            this.currentLineIndex = Math.max(0, this.currentLineIndex - 1);
+            this.currentChunkSize = 1; // Reset chunk size when user manually navigates
             this.currentLineStarted = false;
             this.progressFill.style.width = '0%';
             this.updatePlayerDisplay();
-            
+
             if (this.isPlaying && !this.isPaused) {
+                // Start playing the newly selected line
                 this.playCurrentLine();
             } else {
                 this.setStatus(`Moved to line ${this.currentLineIndex + 1}`);
             }
         } else {
-            this.audioPlayer.currentTime = 0;
+            try { this.audioPlayer.currentTime = 0; } catch(e){}
             this.progressFill.style.width = '0%';
             this.setStatus('Already at the first line');
         }

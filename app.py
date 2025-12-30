@@ -20,6 +20,14 @@ os.environ["SUNO_OFFLOAD_CPU"] = "False"  # Keep on GPU
 os.environ["SUNO_USE_SMALL_MODELS"] = "False"  # Full quality models
 
 import torch
+# Configure CPU thread usage for heavy CPU fallback (can be overridden with BARK_CPU_THREADS env var)
+CPU_THREADS = int(os.environ.get('BARK_CPU_THREADS', max(1, (os.cpu_count() or 2) - 1)))
+try:
+    torch.set_num_threads(CPU_THREADS)
+    torch.set_num_interop_threads(max(1, int(CPU_THREADS/2)))
+except Exception:
+    pass
+print(f"🧮 CPU threads set to: {CPU_THREADS}")
 print(f"🎮 PyTorch CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
@@ -175,7 +183,10 @@ def preprocess_text_for_speech(text, read_symbols=True):
     
     # Handle snake_case - replace underscores with spaces for readability
     processed = re.sub(r'_([a-zA-Z])', r' \1', processed)
-    
+
+    # Replace dot between alphanumeric chars (e.g., db.students) with ' dot ' for code clarity
+    processed = re.sub(r'(?<=\w)\.(?=\w)', ' dot ', processed)
+
     # Restore BARK tags
     for placeholder, tag in preserved.items():
         processed = processed.replace(placeholder, tag)
@@ -185,19 +196,21 @@ def preprocess_text_for_speech(text, read_symbols=True):
 def split_into_lines(text):
     """
     Split text into chunks optimal for BARK (~100-150 chars for best quality).
+    Also merges very short lines to avoid prosody issues and appends a period to short fragments
+    so the TTS doesn't invent filler sounds.
     """
-    lines = text.split('\n')
+    MIN_LEN = 45  # Merge lines shorter than this with the next
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
     result = []
     
     for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        
         # BARK works best with shorter segments
         if len(line) > 180:
             sentences = re.split(r'(?<=[.!?])\s+', line)
             for sentence in sentences:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
                 if len(sentence) > 180:
                     parts = sentence.split(', ')
                     current = ""
@@ -210,12 +223,38 @@ def split_into_lines(text):
                             current = part
                     if current:
                         result.append(current)
-                elif sentence.strip():
-                    result.append(sentence.strip())
+                elif sentence:
+                    result.append(sentence)
         else:
             result.append(line)
     
-    return result
+    # Merge very short lines with the following line to provide context
+    merged = []
+    i = 0
+    while i < len(result):
+        cur = result[i]
+        if len(cur) < MIN_LEN and i + 1 < len(result):
+            # Merge with next line
+            merged_line = f"{cur} {result[i+1]}"
+            merged.append(merged_line)
+            i += 2
+        else:
+            merged.append(cur)
+            i += 1
+
+    # Ensure short fragments get terminal punctuation to reduce filler noises
+    final = []
+    for line in merged:
+        line = line.strip()
+        # If the line looks like code (contains braces, arrows, dot notation), add a small pause '...'
+        if re.search(r'[{}()=<>]|\w+\.\w+|=>|->', line):
+            if not re.search(r'[\.\!\?]$', line):
+                line = line + ' ...'
+        elif len(line) < 60 and not re.search(r'[\.\!\?]$', line):
+            line = line + '.'
+        final.append(line)
+
+    return final
 
 def get_cache_filename(text, voice):
     """Generate unique cache filename."""
@@ -244,22 +283,55 @@ def load_bark_models():
         loading_status = {"status": "error", "message": str(e)}
         print(f"\n❌ Error loading models: {e}")
 
-def generate_bark_audio(text, voice_preset, output_file):
-    """Generate audio using BARK on GPU."""
+def generate_bark_audio(text, voice_preset, output_file, force_cpu=False):
+    """Generate audio using BARK. Supports optional CPU-only generation by setting
+    environment flags and increasing CPU thread usage temporarily."""
     if not models_loaded:
         raise Exception("Models not loaded yet")
-    
-    # Generate audio
-    audio_array = generate_audio(text, history_prompt=voice_preset)
-    
-    # Normalize and convert to int16
-    audio_array = np.clip(audio_array, -1, 1)
-    audio_int16 = (audio_array * 32767).astype(np.int16)
-    
-    # Save as WAV
-    write_wav(output_file, SAMPLE_RATE, audio_int16)
-    
-    return output_file
+
+    # Save current env settings to restore later
+    prev_offload = os.environ.get('SUNO_OFFLOAD_CPU')
+    prev_small = os.environ.get('SUNO_USE_SMALL_MODELS')
+
+    try:
+        if force_cpu:
+            # Force CPU-heavy mode
+            os.environ['SUNO_OFFLOAD_CPU'] = 'True'
+            os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
+            try:
+                torch.set_num_threads(CPU_THREADS)
+                torch.set_num_interop_threads(max(1, int(CPU_THREADS/2)))
+            except Exception:
+                pass
+
+        # Generate audio (BARK handles device placement)
+        audio_array = generate_audio(text, history_prompt=voice_preset)
+
+        # Normalize and convert to int16
+        audio_array = np.clip(audio_array, -1, 1)
+        audio_int16 = (audio_array * 32767).astype(np.int16)
+
+        # Save as WAV
+        write_wav(output_file, SAMPLE_RATE, audio_int16)
+
+        return output_file
+
+    finally:
+        # Restore env flags
+        if prev_offload is None:
+            os.environ.pop('SUNO_OFFLOAD_CPU', None)
+        else:
+            os.environ['SUNO_OFFLOAD_CPU'] = prev_offload
+        if prev_small is None:
+            os.environ.pop('SUNO_USE_SMALL_MODELS', None)
+        else:
+            os.environ['SUNO_USE_SMALL_MODELS'] = prev_small
+        try:
+            # Reset threads to configured default
+            torch.set_num_threads(CPU_THREADS)
+            torch.set_num_interop_threads(max(1, int(CPU_THREADS/2)))
+        except Exception:
+            pass
 
 @app.route('/', methods=['GET'])
 def index():
@@ -315,22 +387,55 @@ def generate_line_audio():
     """Generate audio for a single line using BARK."""
     if not models_loaded:
         return jsonify({'error': 'Models still loading. Please wait...'}), 503
-    
+
     data = request.json
     text = data.get('text', '')
     voice = data.get('voice', 'v2/en_speaker_6')
-    
+    hybrid = data.get('hybrid', True)
+    force_cpu = data.get('force_cpu', False)
+
     if not text.strip():
         return jsonify({'error': 'No text provided'}), 400
-    
+
     cache_file = get_cache_filename(text, voice)
-    
+
     if not os.path.exists(cache_file):
         try:
-            generate_bark_audio(text, voice, cache_file)
+            # If force_cpu is requested, attempt CPU-only generation
+            if force_cpu:
+                generate_bark_audio(text, voice, cache_file, force_cpu=True)
+            else:
+                # If hybrid mode is requested, attempt to detect low GPU memory and switch to small models
+                reverted_small_models = False
+                if hybrid and torch.cuda.is_available():
+                    try:
+                        total = torch.cuda.get_device_properties(0).total_memory
+                        used = torch.cuda.memory_allocated(0)
+                        free = total - used
+                        # If less than ~1 GB free, request smaller models to avoid OOM
+                        if free < 1 * 1024**3:
+                            os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
+                            reverted_small_models = True
+                    except Exception:
+                        pass
+
+                generate_bark_audio(text, voice, cache_file)
+
+                # Revert small models env var if changed
+                if reverted_small_models:
+                    os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
+
+        except RuntimeError as e:
+            # GPU OOM or other runtime errors - try fallback with small models
+            try:
+                os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
+                generate_bark_audio(text, voice, cache_file)
+                os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
+            except Exception as e2:
+                return jsonify({'error': str(e2)}), 500
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-    
+
     return send_file(cache_file, mimetype='audio/wav')
 
 @app.route('/api/generate-full-audio', methods=['POST'])
@@ -338,28 +443,53 @@ def generate_full_audio():
     """Generate audio for full text."""
     if not models_loaded:
         return jsonify({'error': 'Models still loading'}), 503
-    
+
     data = request.json
     text = data.get('text', '')
     voice = data.get('voice', 'v2/en_speaker_6')
     read_code_symbols = data.get('readCodeSymbols', True)
-    
+    hybrid = data.get('hybrid', True)
+
     if not text.strip():
         return jsonify({'error': 'No text provided'}), 400
-    
+
     if read_code_symbols:
         processed_text = preprocess_text_for_speech(text, True)
     else:
         processed_text = text
-    
+
     cache_file = get_cache_filename(processed_text, voice)
-    
+
     if not os.path.exists(cache_file):
         try:
+            reverted_small_models = False
+            if hybrid and torch.cuda.is_available():
+                try:
+                    total = torch.cuda.get_device_properties(0).total_memory
+                    used = torch.cuda.memory_allocated(0)
+                    free = total - used
+                    if free < 1 * 1024**3:
+                        os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
+                        reverted_small_models = True
+                except Exception:
+                    pass
+
             generate_bark_audio(processed_text, voice, cache_file)
+
+            if reverted_small_models:
+                os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
+
+        except RuntimeError as e:
+            # Try fallback with small models
+            try:
+                os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
+                generate_bark_audio(processed_text, voice, cache_file)
+                os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
+            except Exception as e2:
+                return jsonify({'error': str(e2)}), 500
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-    
+
     return send_file(cache_file, mimetype='audio/wav', as_attachment=True,
                      download_name='bark_tts_output.wav')
 
