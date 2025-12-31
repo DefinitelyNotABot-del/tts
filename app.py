@@ -60,33 +60,39 @@ def ai_preprocess_text(text):
     - Understands context to improve readability
     """
     try:
-        prompt = f"""You are a text preprocessing assistant for a text-to-speech system. Your job is to analyze the following text and improve it for natural speech generation.
+        prompt = f"""You are a text preprocessing assistant for a text-to-speech system. Analyze the text and improve it for natural speech.
 
 Rules:
-1. Add proper punctuation (periods, commas, question marks) where missing
-2. Fix spacing issues (add spaces between words if missing)
-3. Break very long sentences into shorter ones with commas or periods
-4. Preserve code structure but add pauses (...) after code statements
-5. Keep the original meaning and content intact
-6. Do NOT add explanations, just return the improved text
+1. Preserve headings and list structure - add period after headings
+2. Keep line breaks between sections/items
+3. Add commas in lists after dash/bullet items
+4. Fix spacing (add spaces between words if missing)
+5. Add periods at end of statements if missing
+6. For headings followed by items, add a period after heading
+7. Keep original meaning intact
+8. Return ONLY the improved text, no explanations
+
+Example:
+Input: "NoSQL\\n\\nOpen source – Freely available"
+Output: "NoSQL.\\n\\nOpen source, freely available."
 
 Original text:
 {text}
 
-Improved text for speech:"""
+Improved text:"""
 
         payload = {
             "model": QWEN_MODEL,
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.3,
-                "top_p": 0.9,
-                "max_tokens": 2048
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "max_tokens": 4096
             }
         }
 
-        response = requests.post(QWEN_API_URL, json=payload, timeout=30)
+        response = requests.post(QWEN_API_URL, json=payload, timeout=45)
         
         if response.status_code == 200:
             result = response.json()
@@ -94,6 +100,7 @@ Improved text for speech:"""
             
             # If AI returned something reasonable, use it
             if improved_text and len(improved_text) > 10:
+                print(f"✨ AI preprocessing applied: {len(text)} → {len(improved_text)} chars")
                 return improved_text
             else:
                 return text
@@ -102,7 +109,7 @@ Improved text for speech:"""
             return text
             
     except requests.exceptions.RequestException as e:
-        print(f"⚠️ Qwen connection failed: {e}")
+        print(f"⚠️ Qwen connection failed: {e} - Is Ollama running? Run 'ollama serve'")
         return text
     except Exception as e:
         print(f"⚠️ AI preprocessing error: {e}")
@@ -258,15 +265,33 @@ def preprocess_text_for_speech(text, read_symbols=True):
 def split_into_lines(text):
     """
     Split text into chunks optimal for BARK (~100-150 chars for best quality).
-    Also merges very short lines to avoid prosody issues and appends a period to short fragments
-    so the TTS doesn't invent filler sounds.
+    Preserves structure: headings stay separate, list items stay intact.
     """
-    MIN_LEN = 45  # Merge lines shorter than this with the next
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    MIN_LEN = 35  # Merge lines shorter than this with the next (unless it's a heading)
+    lines = [l.rstrip() for l in text.split('\n')]
     result = []
     
-    for line in lines:
-        # BARK works best with shorter segments
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        # Skip completely empty lines but preserve structure markers
+        if not line:
+            i += 1
+            continue
+        
+        # Detect headings: short lines (< 30 chars) with no punctuation at end
+        is_heading = len(line) < 30 and not re.search(r'[.!?,]$', line) and not line.startswith('-') and not line.startswith('•')
+        
+        if is_heading:
+            # Headings stay separate, add period if missing
+            if not re.search(r'[\.\!\?]$', line):
+                line = line + '.'
+            result.append(line)
+            i += 1
+            continue
+        
+        # Regular processing for long lines
         if len(line) > 180:
             sentences = re.split(r'(?<=[.!?])\s+', line)
             for sentence in sentences:
@@ -274,6 +299,7 @@ def split_into_lines(text):
                 if not sentence:
                     continue
                 if len(sentence) > 180:
+                    # Split by commas
                     parts = sentence.split(', ')
                     current = ""
                     for part in parts:
@@ -285,34 +311,24 @@ def split_into_lines(text):
                             current = part
                     if current:
                         result.append(current)
-                elif sentence:
+                else:
                     result.append(sentence)
         else:
             result.append(line)
-    
-    # Merge very short lines with the following line to provide context
-    merged = []
-    i = 0
-    while i < len(result):
-        cur = result[i]
-        if len(cur) < MIN_LEN and i + 1 < len(result):
-            # Merge with next line
-            merged_line = f"{cur} {result[i+1]}"
-            merged.append(merged_line)
-            i += 2
-        else:
-            merged.append(cur)
-            i += 1
+        
+        i += 1
 
-    # Ensure short fragments get terminal punctuation to reduce filler noises
+    # Add terminal punctuation to items without it (but not headings)
     final = []
-    for line in merged:
+    for line in result:
         line = line.strip()
-        # If the line looks like code (contains braces, arrows, dot notation), add a small pause '...'
-        if re.search(r'[{}()=<>]|\w+\.\w+|=>|->', line):
+        if not line:
+            continue
+        # If line looks like code or list item, add ellipsis for pause
+        if re.search(r'[{}()=<>]|\w+\.\w+|=>|->|–|—', line):
             if not re.search(r'[\.\!\?]$', line):
-                line = line + ' ...'
-        elif len(line) < 60 and not re.search(r'[\.\!\?]$', line):
+                line = line + '...'
+        elif len(line) < 50 and not re.search(r'[\.\!\?]$', line):
             line = line + '.'
         final.append(line)
 

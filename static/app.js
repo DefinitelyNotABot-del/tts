@@ -337,12 +337,72 @@ class TTSPlayer {
             this.updatePlayerDisplay();
             this.hideLoading();
             
-            this.setStatus(`Loaded ${this.lines.length} lines - Press Play to start`, 'success');
+            const aiNote = data.ai_enhanced ? ' (AI-enhanced)' : '';
+            this.setStatus(`Loaded ${this.lines.length} lines${aiNote} - Starting background generation...`, 'success');
+            
+            // Start background generation of all lines
+            this.startBackgroundGeneration();
+            
         } catch (error) {
             console.error('Failed to process text:', error);
             this.hideLoading();
             this.setStatus('Failed to process text', 'error');
         }
+    }
+    
+    async startBackgroundGeneration() {
+        // Generate all lines in background for smooth playback
+        this.setStatus('🔄 Pre-generating audio for all lines...', 'info');
+        
+        let completed = 0;
+        const total = this.processedLines.length;
+        
+        // Process in small batches to avoid overwhelming the server
+        const batchSize = 3;
+        for (let i = 0; i < total; i += batchSize) {
+            const batch = [];
+            
+            for (let j = i; j < Math.min(i + batchSize, total); j++) {
+                const text = this.processedLines[j];
+                const cacheKey = `${text}_${this.selectedVoice}`;
+                
+                // Skip if already cached
+                if (this.audioCache.has(cacheKey)) {
+                    completed++;
+                    continue;
+                }
+                
+                // Generate in background
+                batch.push(
+                    fetch('/api/generate-line-audio', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            text: text,
+                            voice: this.selectedVoice,
+                            hybrid: this.hybridMode,
+                            force_cpu: this.useCpuAggressive
+                        })
+                    })
+                    .then(response => response.blob())
+                    .then(blob => {
+                        const audioUrl = URL.createObjectURL(blob);
+                        this.audioCache.set(cacheKey, audioUrl);
+                        completed++;
+                        this.setStatus(`🔄 Generated ${completed}/${total} lines...`, 'info');
+                    })
+                    .catch(err => {
+                        console.warn(`Failed to pregenerate line ${j}:`, err);
+                        completed++;
+                    })
+                );
+            }
+            
+            // Wait for current batch to complete before starting next
+            await Promise.all(batch);
+        }
+        
+        this.setStatus(`✅ All ${total} lines ready! Press Play to start`, 'success');
     }
     
     renderLineList() {

@@ -76,19 +76,32 @@ On first launch, the app will automatically download ~13GB of AI models:
 
 For better text normalization (adds punctuation, fixes spacing, understands context):
 
-1. **Install Ollama** from https://ollama.ai
+1. **Install Ollama** from https://ollama.ai (or `winget install Ollama.Ollama`)
+
 2. **Pull Qwen2.5**:
 ```bash
 ollama pull qwen2.5:latest
 ```
-3. **Start Ollama** (runs on http://localhost:11434 by default)
-4. **Enable in UI**: Check "AI-enhanced preprocessing (Qwen2.5)"
+
+3. **Start Ollama server** (required before running the TTS app):
+```bash
+ollama serve
+```
+   - Ollama runs on http://localhost:11434 by default
+   - Keep this terminal open while using AI preprocessing
+
+4. **Run the TTS app** (in a separate terminal)
+
+5. **Enable in UI**: Check "AI-enhanced preprocessing (Qwen2.5)"
 
 The AI will analyze your text and:
 - Add missing punctuation and commas
-- Fix spacing issues
+- Fix spacing issues (no spaces → adds them)
 - Improve prosody for natural speech
+- Separate headings from list items properly
 - Understand context before TTS generation
+
+**Important**: You must run `ollama serve` in a terminal BEFORE starting the TTS app, otherwise AI preprocessing will be skipped with a warning.
 
 You can customize the Qwen API endpoint:
 ```powershell
