@@ -41,6 +41,7 @@ Automatically converts programming symbols to spoken words:
 - NVIDIA GPU with CUDA support (recommended, RTX 3060 or better)
 - 8GB+ VRAM recommended for best performance
 - ~13GB disk space for AI models
+- **Optional**: Ollama with Qwen2.5 for AI-enhanced preprocessing
 
 ### Installation
 
@@ -70,6 +71,31 @@ On first launch, the app will automatically download ~13GB of AI models:
 - `fine_2.pt` (3.74GB) - Audio quality refinement
 
 **Models are downloaded once and cached locally** - subsequent runs start instantly.
+
+### Optional: AI-Enhanced Preprocessing (Qwen2.5)
+
+For better text normalization (adds punctuation, fixes spacing, understands context):
+
+1. **Install Ollama** from https://ollama.ai
+2. **Pull Qwen2.5**:
+```bash
+ollama pull qwen2.5:latest
+```
+3. **Start Ollama** (runs on http://localhost:11434 by default)
+4. **Enable in UI**: Check "AI-enhanced preprocessing (Qwen2.5)"
+
+The AI will analyze your text and:
+- Add missing punctuation and commas
+- Fix spacing issues
+- Improve prosody for natural speech
+- Understand context before TTS generation
+
+You can customize the Qwen API endpoint:
+```powershell
+$env:QWEN_API_URL = "http://localhost:11434/api/generate"
+$env:QWEN_MODEL = "qwen2.5:latest"
+python app.py
+```
 
 ## 🎮 Usage
 

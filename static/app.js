@@ -18,8 +18,10 @@ class TTSPlayer {
         // Settings
         this.selectedVoice = 'v2/en_speaker_6';
         this.readCodeSymbols = true;
+        this.useAiPreprocessing = false; // AI enhancement toggle
         this.useFullGen = false; // single-file generation toggle
         this.hybridMode = true; // auto GPU/CPU fallback
+        this.useCpuAggressive = false;
         
         // Playback tracking
         this.currentLineStarted = false;
@@ -56,6 +58,7 @@ class TTSPlayer {
         // Additional settings
         this.useFullGenCheckbox = document.getElementById('useFullGen');
         this.hybridModeCheckbox = document.getElementById('hybridMode');
+        this.useAiPreprocessingCheckbox = document.getElementById('useAiPreprocessing');
         
         // Icons
         this.playPauseIcon = document.getElementById('playPauseIcon');
@@ -138,6 +141,18 @@ class TTSPlayer {
         this.readCodeSymbolsCheckbox.addEventListener('change', (e) => {
             this.readCodeSymbols = e.target.checked;
         });
+        
+        this.useAiPreprocessingCheckbox.addEventListener('change', (e) => {
+            this.useAiPreprocessing = e.target.checked;
+            if (e.target.checked) {
+                this.setStatus('AI preprocessing enabled - will analyze text context', 'success');
+            }
+        });
+        
+        this.useFullGenCheckbox.addEventListener('change', (e) => { this.useFullGen = e.target.checked; });
+        this.hybridModeCheckbox.addEventListener('change', (e) => { this.hybridMode = e.target.checked; });
+        this.forceCpuCheckbox = document.getElementById('forceCpuMode');
+        this.forceCpuCheckbox?.addEventListener('change', (e) => { this.useCpuAggressive = e.target.checked; });
         
         // Progress bar click
         this.progressBar.addEventListener('click', (e) => {
@@ -306,7 +321,8 @@ class TTSPlayer {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     text: text,
-                    readCodeSymbols: this.readCodeSymbols
+                    readCodeSymbols: this.readCodeSymbols,
+                    useAiPreprocessing: this.useAiPreprocessing
                 })
             });
             

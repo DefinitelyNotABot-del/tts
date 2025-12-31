@@ -10,6 +10,8 @@ import re
 import hashlib
 import threading
 import numpy as np
+import requests
+import json
 from scipy.io.wavfile import write as write_wav
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
@@ -45,6 +47,66 @@ os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 # Track if models are loaded
 models_loaded = False
 loading_status = {"status": "not_started", "message": ""}
+
+# Qwen2.5 configuration (assuming local Ollama or similar API)
+QWEN_API_URL = os.environ.get('QWEN_API_URL', 'http://localhost:11434/api/generate')
+QWEN_MODEL = os.environ.get('QWEN_MODEL', 'qwen2.5:latest')
+
+def ai_preprocess_text(text):
+    """
+    Use Qwen2.5 to analyze and normalize text before TTS:
+    - Adds proper punctuation and spacing
+    - Fixes structure for better prosody
+    - Understands context to improve readability
+    """
+    try:
+        prompt = f"""You are a text preprocessing assistant for a text-to-speech system. Your job is to analyze the following text and improve it for natural speech generation.
+
+Rules:
+1. Add proper punctuation (periods, commas, question marks) where missing
+2. Fix spacing issues (add spaces between words if missing)
+3. Break very long sentences into shorter ones with commas or periods
+4. Preserve code structure but add pauses (...) after code statements
+5. Keep the original meaning and content intact
+6. Do NOT add explanations, just return the improved text
+
+Original text:
+{text}
+
+Improved text for speech:"""
+
+        payload = {
+            "model": QWEN_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "max_tokens": 2048
+            }
+        }
+
+        response = requests.post(QWEN_API_URL, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            improved_text = result.get('response', '').strip()
+            
+            # If AI returned something reasonable, use it
+            if improved_text and len(improved_text) > 10:
+                return improved_text
+            else:
+                return text
+        else:
+            print(f"⚠️ Qwen API error: {response.status_code}")
+            return text
+            
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️ Qwen connection failed: {e}")
+        return text
+    except Exception as e:
+        print(f"⚠️ AI preprocessing error: {e}")
+        return text
 
 # BARK Speaker presets - Neural voice embeddings with unique characteristics
 VOICE_PRESETS = {
@@ -368,9 +430,16 @@ def process_text():
     data = request.json
     text = data.get('text', '')
     read_code_symbols = data.get('readCodeSymbols', True)
+    use_ai_preprocessing = data.get('useAiPreprocessing', False)
     
+    # Step 1: AI preprocessing if enabled
+    if use_ai_preprocessing:
+        text = ai_preprocess_text(text)
+    
+    # Step 2: Split into lines
     lines = split_into_lines(text)
     
+    # Step 3: Apply symbol reading if enabled
     if read_code_symbols:
         processed_lines = [preprocess_text_for_speech(line, True) for line in lines]
     else:
@@ -379,7 +448,8 @@ def process_text():
     return jsonify({
         'original_lines': lines,
         'processed_lines': processed_lines,
-        'total_lines': len(lines)
+        'total_lines': len(lines),
+        'ai_enhanced': use_ai_preprocessing
     })
 
 @app.route('/api/generate-line-audio', methods=['POST'])
