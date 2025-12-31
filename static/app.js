@@ -135,7 +135,10 @@ class TTSPlayer {
         // Settings events
         this.voiceSelect.addEventListener('change', (e) => {
             this.selectedVoice = e.target.value;
+            console.log(`🎤 Voice changed to: ${e.target.value}`);
             this.setStatus(`Voice changed to ${e.target.options[e.target.selectedIndex].text}`);
+            // Clear cache when voice changes to force regeneration
+            this.audioCache.clear();
         });
         
         this.readCodeSymbolsCheckbox.addEventListener('change', (e) => {

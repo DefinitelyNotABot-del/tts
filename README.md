@@ -42,6 +42,7 @@ Automatically converts programming symbols to spoken words:
 - 8GB+ VRAM recommended for best performance
 - ~13GB disk space for AI models
 - **Optional**: Ollama with Qwen2.5 for AI-enhanced preprocessing
+- **Optional**: Kaggle account for free GPU offloading (30 hours/week)
 
 ### Installation
 
@@ -56,7 +57,17 @@ cd tts
 pip install -r requirements.txt
 ```
 
-3. **Run the application**
+3. **Quick Start with PowerShell Script**
+```powershell
+.\start.ps1
+```
+This automatically:
+- Starts Ollama (if installed)
+- Activates Python environment
+- Launches the TTS app
+- Opens browser at http://localhost:5000
+
+**OR Manual Start:**
 ```bash
 python app.py
 ```

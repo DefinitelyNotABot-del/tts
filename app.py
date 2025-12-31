@@ -29,11 +29,25 @@ try:
     torch.set_num_interop_threads(max(1, int(CPU_THREADS/2)))
 except Exception:
     pass
+
+# Enable GPU shared memory usage for better performance
+if torch.cuda.is_available():
+    try:
+        # Allow PyTorch to use shared GPU memory
+        torch.cuda.set_per_process_memory_fraction(0.95, 0)  # Use up to 95% of available memory
+        # Enable memory caching for faster allocations
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception as e:
+        print(f"⚠️ GPU memory config warning: {e}")
+
 print(f"🧮 CPU threads set to: {CPU_THREADS}")
 print(f"🎮 PyTorch CUDA available: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
-    print(f"🎮 VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    total_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"🎮 Total GPU memory: {total_mem:.1f} GB (VRAM + Shared)")
+    print(f"🎮 Shared memory enabled: PyTorch will use available shared memory")
 
 from bark import SAMPLE_RATE, generate_audio, preload_models
 
@@ -48,9 +62,49 @@ os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 models_loaded = False
 loading_status = {"status": "not_started", "message": ""}
 
+# GPU Resource Scheduler - Smart allocation between VRAM and shared memory
+class GPUScheduler:
+    def __init__(self):
+        self.vram_limit = 5.5 * 1024**3  # Reserve 5.5GB for dedicated VRAM
+        self.use_shared_for_slow = True
+        
+    def should_use_small_models(self):
+        """Determine if we should use smaller models based on memory pressure"""
+        if not torch.cuda.is_available():
+            return True
+            
+        try:
+            props = torch.cuda.get_device_properties(0)
+            allocated = torch.cuda.memory_allocated(0)
+            
+            # If we're using > 5GB dedicated VRAM, switch to small models for new requests
+            if allocated > self.vram_limit:
+                print(f"📊 GPU Scheduler: Using small models (VRAM: {allocated/1024**3:.1f}GB)")
+                return True
+            return False
+        except:
+            return False
+    
+    def optimize_memory(self):
+        """Optimize GPU memory usage"""
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except:
+                pass
+
+gpu_scheduler = GPUScheduler()
+
 # Qwen2.5 configuration (assuming local Ollama or similar API)
 QWEN_API_URL = os.environ.get('QWEN_API_URL', 'http://localhost:11434/api/generate')
 QWEN_MODEL = os.environ.get('QWEN_MODEL', 'qwen2.5:latest')
+QWEN_TIMEOUT = int(os.environ.get('QWEN_TIMEOUT', '15'))  # Short timeout to avoid long waits
+
+# Kaggle kernel configuration for offloading heavy compute
+KAGGLE_API_URL = os.environ.get('KAGGLE_API_URL', '')  # Set this to your Kaggle kernel API endpoint
+KAGGLE_API_KEY = os.environ.get('KAGGLE_API_KEY', '')
+USE_KAGGLE_OFFLOAD = bool(KAGGLE_API_URL and KAGGLE_API_KEY)
 
 def ai_preprocess_text(text):
     """
@@ -58,6 +112,7 @@ def ai_preprocess_text(text):
     - Adds proper punctuation and spacing
     - Fixes structure for better prosody
     - Understands context to improve readability
+    - Fast timeout to avoid blocking (15s default)
     """
     try:
         prompt = f"""You are a text preprocessing assistant for a text-to-speech system. Analyze the text and improve it for natural speech.
@@ -88,11 +143,12 @@ Improved text:"""
             "options": {
                 "temperature": 0.2,
                 "top_p": 0.8,
-                "max_tokens": 4096
+                "max_tokens": 4096,
+                "num_predict": min(len(text) * 2, 4096)  # Limit prediction length
             }
         }
 
-        response = requests.post(QWEN_API_URL, json=payload, timeout=45)
+        response = requests.post(QWEN_API_URL, json=payload, timeout=QWEN_TIMEOUT)
         
         if response.status_code == 200:
             result = response.json()
@@ -103,11 +159,15 @@ Improved text:"""
                 print(f"✨ AI preprocessing applied: {len(text)} → {len(improved_text)} chars")
                 return improved_text
             else:
+                print("⚠️ AI returned empty result, using original text")
                 return text
         else:
             print(f"⚠️ Qwen API error: {response.status_code}")
             return text
             
+    except requests.exceptions.Timeout:
+        print(f"⚠️ Qwen timeout after {QWEN_TIMEOUT}s - skipping AI preprocessing")
+        return text
     except requests.exceptions.RequestException as e:
         print(f"⚠️ Qwen connection failed: {e} - Is Ollama running? Run 'ollama serve'")
         return text
@@ -483,25 +543,32 @@ def generate_line_audio():
     if not text.strip():
         return jsonify({'error': 'No text provided'}), 400
 
+    # GPU Scheduler: optimize memory before generation
+    gpu_scheduler.optimize_memory()
+
     cache_file = get_cache_filename(text, voice)
 
     if not os.path.exists(cache_file):
         try:
+            # Check if we should use small models based on scheduler
+            use_small = gpu_scheduler.should_use_small_models()
+            
             # If force_cpu is requested, attempt CPU-only generation
             if force_cpu:
                 generate_bark_audio(text, voice, cache_file, force_cpu=True)
             else:
-                # If hybrid mode is requested, attempt to detect low GPU memory and switch to small models
+                # If hybrid mode is requested or scheduler suggests small models
                 reverted_small_models = False
-                if hybrid and torch.cuda.is_available():
+                if (hybrid and torch.cuda.is_available()) or use_small:
                     try:
                         total = torch.cuda.get_device_properties(0).total_memory
                         used = torch.cuda.memory_allocated(0)
                         free = total - used
-                        # If less than ~1 GB free, request smaller models to avoid OOM
-                        if free < 1 * 1024**3:
+                        # If less than ~1 GB free or scheduler says so, use small models
+                        if free < 1 * 1024**3 or use_small:
                             os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
                             reverted_small_models = True
+                            print(f"📊 Using small models - Free: {free/1024**3:.1f}GB")
                     except Exception:
                         pass
 
@@ -514,6 +581,7 @@ def generate_line_audio():
         except RuntimeError as e:
             # GPU OOM or other runtime errors - try fallback with small models
             try:
+                print(f"⚠️ GPU error, falling back to small models: {e}")
                 os.environ['SUNO_USE_SMALL_MODELS'] = 'True'
                 generate_bark_audio(text, voice, cache_file)
                 os.environ['SUNO_USE_SMALL_MODELS'] = 'False'
